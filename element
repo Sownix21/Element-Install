@@ -1,0 +1,552 @@
+#!/usr/bin/python3 -I
+"""Install and operate Element Server Suite Community on a dedicated K3s node.
+
+Everything (K3s, Helm, charts, container images) is downloaded from the GitHub
+Release bundle built by .github/workflows/mirror.yml, so the VPS only needs to
+reach github.com (and Let's Encrypt for certificates), not ghcr.io, quay.io,
+oci.element.io, docker.io or get.helm.sh.
+"""
+import contextlib
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+
+BUNDLE_REPO = "Sownix21/Element-Install"
+BUNDLE_URL = f"https://github.com/{BUNDLE_REPO}/releases"
+STATE = Path("/etc/element-install")
+CACHE = Path("/var/lib/element-install")
+CONFIG = STATE / "config.json"
+PAUSED = STATE / "replicas.json"
+COMMAND = Path("/usr/local/bin/element")
+K3S_IMAGES = Path("/var/lib/rancher/k3s/agent/images")
+ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine())
+KUBE = ["k3s", "kubectl"]
+CTR = ["k3s", "ctr", "-n", "k8s.io", "images"]
+ESS = [*KUBE, "-n", "ess"]
+SERVICES = {"synapse": "matrix", "matrixAuthenticationService": "account",
+            "matrixRTC": "mrtc", "elementWeb": "chat", "elementAdmin": "admin"}
+CURL = ["curl", "--proto", "=https", "--proto-redir", "=https", "-fL", "--progress-bar",
+        "--retry", "5", "--retry-all-errors", "--connect-timeout", "20",
+        "--speed-limit", "10000", "--speed-time", "60"]
+NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def run(*args, capture=False, **kwargs):
+    result = subprocess.run(args, check=True, text=True,
+                            stdout=subprocess.PIPE if capture else None, **kwargs)
+    return result.stdout.strip() if capture else None
+
+
+def write(path, data, mode=0o600):
+    """Replace on the same filesystem so retries always see a complete file."""
+    tmp = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
+    try:
+        with tmp:
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp.name, mode)
+        os.replace(tmp.name, path)
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def save(path, obj):
+    write(path, (json.dumps(obj, indent=2) + "\n").encode())
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def download(url):
+    return run("curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
+               "--retry", "3", "--connect-timeout", "15", "--max-time", "180",
+               url, capture=True)
+
+
+# ---------------------------------------------------------------- bundle ----
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def manifest(tag=None):
+    """Fetch the bundle manifest: the latest bundle, or a pinned bundle tag."""
+    where = f"download/{tag}" if tag else "latest/download"
+    data = json.loads(download(f"{BUNDLE_URL}/{where}/manifest.json"))
+    if data.get("schema") != 1 or not NAME.fullmatch(data.get("tag", "")):
+        raise ValueError("Unsupported bundle manifest. Rerun the one-line installer to refresh element.")
+    for item in data["files"]:
+        if not NAME.fullmatch(item["name"]) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
+            raise ValueError(f"Invalid manifest entry: {item['name']}")
+    data["base"] = f"{BUNDLE_URL}/download/{data['tag']}"
+    return data
+
+
+def pick(man, *roles):
+    return [f for f in man["files"] if f["role"] in roles and f["arch"] in (ARCH, "all")]
+
+
+def one(man, role):
+    found = pick(man, role)
+    if len(found) != 1:
+        raise ValueError(f"Bundle {man['tag']} has no single '{role}' file for {ARCH}.")
+    return found[0]
+
+
+def fetch(man, item):
+    """Download one bundle file, resume partial downloads, verify the SHA-256."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    dest = CACHE / item["name"]
+    if dest.exists() and sha256(dest) == item["sha256"]:
+        return dest
+    part = dest.with_name(dest.name + ".part")
+    for _ in range(2):
+        if not (part.exists() and sha256(part) == item["sha256"]):
+            print(f"Downloading {item['name']} ({item['size'] / 1e6:.0f} MB) ...", flush=True)
+            try:
+                run(*CURL, "-C", "-", "-o", str(part), f"{man['base']}/{item['name']}")
+            except subprocess.CalledProcessError:
+                part.unlink(missing_ok=True)  # e.g. resume refused: start over once
+                continue
+        if part.exists() and sha256(part) == item["sha256"]:
+            os.replace(part, dest)
+            return dest
+        part.unlink(missing_ok=True)  # corrupt or stale: start over once
+    raise ValueError(f"Could not download a valid copy of {item['name']}. Retry element install.")
+
+
+def check_disk(man, *roles):
+    total = sum(f["size"] for f in pick(man, *roles))
+    free = shutil.disk_usage("/var/lib").free
+    need = 3 * total + 10**9  # unpacked images are several times the download size
+    if free < need:
+        raise ValueError(f"Need about {need / 1e9:.1f} GB free in /var/lib, found {free / 1e9:.1f} GB.")
+
+
+def norm(ref):
+    """containerd lists Docker Hub official images as docker.io/library/<name>."""
+    host, _, rest = ref.partition("/")
+    return f"docker.io/library/{rest}" if host == "docker.io" and "/" not in rest else ref
+
+
+def load_images(man, *roles):
+    """Import bundled images into K3s's containerd. Skips ones already present."""
+    have = set(run(*CTR, "ls", "-q", capture=True).split())
+    for item in pick(man, *roles):
+        if norm(item["ref"]) in have:
+            continue
+        print(f"Loading {item['ref']} ...", flush=True)
+        archive = fetch(man, item)
+        tmp = CACHE / "import.tar"
+        try:
+            with gzip.open(archive, "rb") as src, tmp.open("wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+            run(*CTR, "import", str(tmp))
+        finally:
+            tmp.unlink(missing_ok=True)
+        archive.unlink()
+
+
+# ----------------------------------------------------------------- setup ----
+
+def hostname(prompt, default="", used=()):
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    while True:
+        value = (input(prompt + (f" [{default}]" if default else "") + ": ").strip()
+                 or default).lower()
+        if (len(value) <= 253 and re.fullmatch(fr"{label}(?:\.{label})+", value)
+                and not value.rsplit(".", 1)[1].isdigit() and value not in used):
+            return value
+        print("Enter a distinct fully qualified DNS name, e.g. chat.example.org.")
+
+
+def dns(hosts):
+    ok = True
+    for host in hosts:
+        try:
+            ips = {entry[4][0] for entry in socket.getaddrinfo(host, 443)}
+            print(f"  {host:<38} {', '.join(sorted(ips))}")
+        except socket.gaierror as error:
+            print(f"  {host}: {error}")
+            ok = False
+    return ok
+
+
+def configure():
+    print("Choose your permanent Matrix identity domain (@alice:example.org).")
+    server = hostname("Matrix server name")
+    hosts = {}
+    for service, prefix in SERVICES.items():
+        hosts[service] = hostname(service, f"{prefix}.{server}", [server, *hosts.values()])
+    while True:
+        email = input("Let's Encrypt contact email: ").strip()
+        if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            break
+    while not dns([server, *hosts.values()]):
+        input("Create or correct the DNS records, then press Enter to recheck (Ctrl-C to exit). ")
+    print("All addresses above must reach this VPS. Allow TCP 80, 443, 30001 and UDP 30002.")
+    if input(f"Install on this dedicated VPS with IDs ending in :{server}? [y/N] ").lower() != "y":
+        raise SystemExit("Cancelled.")
+    man = manifest()
+    versions = man["versions"]
+    print(f"Using bundle {man['tag']}")
+    return dict(server=server, hosts=hosts, email=email, bundle=man["tag"], version=versions["ess_tag"])
+
+
+def values(cfg):
+    return {"serverName": cfg["server"], "certManager": {"clusterIssuer": "letsencrypt-prod"},
+            # Images are preloaded into K3s. IfNotPresent stops kubelet contacting the
+            # upstream registries (the chart default for tags is Always).
+            "image": {"pullPolicy": "IfNotPresent"},
+            **{key: {"ingress": {"host": host}} for key, host in cfg["hosts"].items()}}
+
+
+def packages():
+    """Install only what is missing, so a blocked apt mirror does not stop setup."""
+    required = [p for b, p in [("curl", "curl")] if not shutil.which(b)]
+    if not Path("/etc/ssl/certs/ca-certificates.crt").exists():
+        required.append("ca-certificates")
+    optional = [p for p in ("tar", "iptables") if not shutil.which(p)]
+    if not (required or optional):
+        return
+    print("Installing system packages ...", flush=True)
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    subprocess.run(["apt-get", "update"], check=bool(required))
+    if required:
+        run("apt-get", "install", "-y", *required, env=env)
+    for package in optional:
+        subprocess.run(["apt-get", "install", "-y", package], env=env, check=False)
+
+
+def cluster(cfg, man):
+    print("Preparing K3s and its Traefik ingress ...", flush=True)
+    installer, kbin, airgap, helm_tgz, cm_chart = (
+        fetch(man, one(man, role)) for role in ("k3s-install", "k3s-bin", "k3s-airgap", "helm", "chart-cm"))
+    manifests = Path("/var/lib/rancher/k3s/server/manifests")
+    manifests.mkdir(parents=True, exist_ok=True)
+    port = {"forwardedHeaders": {"trustedIPs": ["10.42.0.0/16", "2001:db8:42::/56"]},
+            "http": {"encodedCharacters": {"allowEncodedHash": True, "allowEncodedSlash": True}}}
+    manifest_yaml = {"apiVersion": "helm.cattle.io/v1", "kind": "HelmChartConfig",
+                     "metadata": {"name": "traefik", "namespace": "kube-system"},
+                     "spec": {"valuesContent": json.dumps({"ports": {"web": port, "websecure": port}})}}
+    save(manifests / "traefik-config.yaml", manifest_yaml)
+
+    # K3s imports every archive in agent/images at start, which supplies its own
+    # system images (coredns, traefik, local-path, metrics-server, pause, ...).
+    K3S_IMAGES.mkdir(parents=True, exist_ok=True)
+    fresh = not (Path("/etc/systemd/system/k3s.service").exists() and shutil.which("k3s"))
+    staged = K3S_IMAGES / airgap.name
+    newly_staged = not staged.exists()
+    if newly_staged:
+        run("install", "-m", "0644", str(airgap), str(staged))
+    if fresh:
+        run("install", "-m", "0755", str(kbin), "/usr/local/bin/k3s")
+        run("sh", str(installer), "server", env={**os.environ, "INSTALL_K3S_SKIP_DOWNLOAD": "true"})
+    run("systemctl", "enable", "--now", "k3s")
+    if newly_staged and not fresh:
+        run("systemctl", "restart", "k3s")  # K3s already ran without its images
+    for _ in range(90):
+        try:
+            if run(*KUBE, "get", "nodes", "-o", "name", capture=True, stderr=subprocess.DEVNULL):
+                break
+        except subprocess.CalledProcessError:
+            pass
+        time.sleep(2)
+    run(*KUBE, "wait", "--for=condition=Ready", "node", "--all", "--timeout=5m")
+
+    if not shutil.which("helm"):
+        with tarfile.open(helm_tgz) as tar:
+            data = tar.extractfile(f"linux-{ARCH}/helm").read()
+        write(Path("/usr/local/bin/helm"), data, 0o755)
+    if not run("helm", "version", "--short", capture=True).startswith("v3."):
+        raise ValueError("This installer requires Helm 3 on PATH.")
+
+    print("Installing cert-manager and configuring Let's Encrypt ...", flush=True)
+    load_images(man, "image-cm")
+    run("helm", "upgrade", "--install", "cert-manager", str(cm_chart), "-n", "cert-manager",
+        "--create-namespace", "--set", "crds.enabled=true", "--wait", "--timeout", "10m")
+    issuer = {"apiVersion": "cert-manager.io/v1", "kind": "ClusterIssuer",
+              "metadata": {"name": "letsencrypt-prod"}, "spec": {"acme": {
+                  "server": "https://acme-v02.api.letsencrypt.org/directory", "email": cfg["email"],
+                  "privateKeySecretRef": {"name": "letsencrypt-prod-private-key"},
+                  "solvers": [{"http01": {"ingress": {"ingressClassName": "traefik"}}}]}}}
+    run(*KUBE, "apply", "-f", "-", input=json.dumps(issuer))
+    run(*KUBE, "wait", "--for=condition=Ready", "clusterissuer/letsencrypt-prod", "--timeout=5m")
+
+
+def deploy(cfg, man):
+    chart = fetch(man, one(man, "chart-ess"))
+    load_images(man, "image-ess")
+    print(f"Deploying official ESS Community {man['versions']['ess_tag']} ...", flush=True)
+    run("helm", "upgrade", "--install", "ess", str(chart), "-n", "ess", "--create-namespace",
+        "--values", "-", "--wait", "--timeout", "20m", input=json.dumps(values(cfg)))
+
+
+def verify(cfg):
+    run(*ESS, "wait", "--for=condition=Ready", "certificate", "--all", "--timeout=10m")
+    base = "https://" + cfg["hosts"]["synapse"]
+    discovery = json.loads(download(f"https://{cfg['server']}/.well-known/matrix/client"))
+    if discovery.get("m.homeserver", {}).get("base_url", "").rstrip("/") != base:
+        raise ValueError("Matrix discovery points to an unexpected homeserver.")
+    if not json.loads(download(base + "/_matrix/client/versions")).get("versions"):
+        raise ValueError("Synapse did not advertise any Matrix client API versions.")
+    run("curl", "-fsSL", "--retry", "4", "--max-time", "20", "-o", "/dev/null",
+        f"https://{cfg['hosts']['elementWeb']}/")
+    print("Element Web: https://" + cfg["hosts"]["elementWeb"])
+    print("Element Admin: https://" + cfg["hosts"]["elementAdmin"])
+
+
+def register():
+    run(*ESS, "exec", "-it", "deploy/ess-matrix-authentication-service", "--",
+        "mas-cli", "manage", "register-user")
+
+
+def check_host():
+    if ARCH is None:
+        raise ValueError(f"Unsupported CPU architecture: {platform.machine()}.")
+    if (os.cpu_count() or 0) < 2:
+        raise ValueError("The upstream quick setup requires at least two CPUs.")
+    mem = re.search(r"^MemTotal:\s+(\d+)", Path("/proc/meminfo").read_text(), re.M)
+    if mem and int(mem[1]) < 1800000:
+        raise ValueError("Use a VPS with at least 2 GB RAM.")
+    for port, kind in [(80, socket.SOCK_STREAM), (443, socket.SOCK_STREAM),
+                       (30001, socket.SOCK_STREAM), (30002, socket.SOCK_DGRAM)]:
+        with socket.socket(socket.AF_INET, kind) as sock:
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError as error:
+                raise ValueError(f"Port {port} is unavailable: {error}") from error
+
+
+def install():
+    if not Path("/run/systemd/system").is_dir() or not shutil.which("apt-get"):
+        raise ValueError("Use a dedicated Debian or Ubuntu VPS running systemd.")
+    if PAUSED.exists():
+        raise ValueError("Run element start before resuming setup.")
+    if not CONFIG.exists():
+        paths = [COMMAND, Path("/etc/rancher/k3s"), Path("/var/lib/rancher/k3s"),
+                 Path("/etc/kubernetes"), Path("/etc/systemd/system/k3s.service")]
+        if any(path.exists() for path in paths) or shutil.which("k3s"):
+            raise ValueError("Existing Kubernetes installation or element command found. Use a fresh VPS.")
+        check_host()
+        packages()
+        cfg = configure()
+        save(CONFIG, cfg)
+    cfg = read(CONFIG)
+    write(COMMAND, Path(__file__).read_bytes(), 0o755)
+    if not cfg.get("deployed"):
+        if ARCH is None:
+            raise ValueError(f"Unsupported CPU architecture: {platform.machine()}.")
+        packages()
+        if "bundle" not in cfg:  # setup started by the older, non-mirrored installer
+            cfg["bundle"] = manifest()["tag"]
+            save(CONFIG, cfg)
+        man = manifest(cfg["bundle"])
+        check_disk(man, "k3s-bin", "k3s-airgap", "helm", "chart-cm", "chart-ess", "image-cm", "image-ess")
+        cluster(cfg, man)
+        deploy(cfg, man)
+        cfg["deployed"] = True
+        save(CONFIG, cfg)
+    verify(cfg)
+    if input("Create a Matrix user now? [Y/n] ").strip().lower() != "n":
+        register()
+    print("Run element from any directory to manage your installation.")
+
+
+def update():
+    cfg = read(CONFIG)
+    man = manifest()
+    tag = man["versions"]["ess_tag"]
+    chart_name = "matrix-stack-" + man["versions"]["ess"]
+    releases = json.loads(run("helm", "list", "-n", "ess", "--all", "--filter", "^ess$",
+                              "-o", "json", capture=True))
+    if len(releases) != 1:
+        raise ValueError("Helm could not find the ESS release. Run element diagnose.")
+    current = releases[0]
+    print(f"Installed {current['chart']} ({current['status']}) | Latest {chart_name}")
+    if current["status"] == "deployed" and current["chart"] == chart_name:
+        cfg["version"] = tag
+        cfg["bundle"] = man["tag"]
+        save(CONFIG, cfg)
+        return
+    print(f"https://github.com/element-hq/ess-helm/releases/tag/{tag}")
+    if input("Review release notes and back up your data. Apply this release? [y/N] ").lower() == "y":
+        check_disk(man, "chart-ess", "image-ess")
+        deploy(cfg, man)
+        cfg["version"] = tag
+        cfg["bundle"] = man["tag"]
+        save(CONFIG, cfg)
+        verify(cfg)
+
+
+# ------------------------------------------------------------ operations ----
+
+def workloads():
+    data = json.loads(run(*ESS, "get", "deploy,sts", "-o", "json", capture=True))
+    replicas = {}
+    for item in data["items"]:
+        meta = item["metadata"]
+        if meta.get("annotations", {}).get("meta.helm.sh/release-name") == "ess":
+            replicas[f"{item['kind'].lower()}/{meta['name']}"] = item["spec"]["replicas"]
+    if not replicas:
+        raise ValueError("No ESS workloads found. Run element diagnose.")
+    return replicas
+
+
+def scale(start):
+    if not PAUSED.exists():
+        if start:
+            print("Already started.")
+            return
+        save(PAUSED, workloads())
+    replicas = read(PAUSED)
+    for name, count in replicas.items():
+        run(*ESS, "scale", name, "--replicas", str(count if start else 0))
+    for name in replicas:
+        if start:
+            run(*ESS, "rollout", "status", name, "--timeout=10m")
+        else:
+            # Kubernetes omits status.replicas when zero.
+            for _ in range(180):
+                count = run(*ESS, "get", name, "-o", "jsonpath={.status.replicas}", capture=True)
+                if count in ("", "0"):
+                    break
+                time.sleep(2)
+            else:
+                raise ValueError(f"Still stopping {name}. Retry element stop.")
+    if start:
+        PAUSED.unlink()
+
+
+def status():
+    print("Desired state:", "stopped" if PAUSED.exists() else "running", flush=True)
+    run("helm", "list", "-n", "ess", "--all")
+    run(*ESS, "get", "deploy,sts,pod,pvc,ingress,certificate")
+
+
+def diagnose():
+    for cmd in [["systemctl", "--no-pager", "status", "k3s"], ["df", "-h", "/var/lib"],
+                ["free", "-h"], ["journalctl", "-u", "k3s", "-n", "30", "--no-pager"],
+                [*KUBE, "get", "nodes", "-o", "wide"], [*KUBE, "get", "pods", "-n", "kube-system"],
+                ["helm", "history", "ess", "-n", "ess"],
+                [*KUBE, "get", "clusterissuer"], [*ESS, "get", "pods,pvc,certificates,orders,challenges"],
+                [*ESS, "get", "events", "--field-selector", "type=Warning",
+                 "--sort-by=.lastTimestamp"]]:
+        print("\n$", " ".join(cmd), flush=True)
+        if shutil.which(cmd[0]):
+            subprocess.run(cmd, check=False)
+    cfg = read(CONFIG)
+    dns([cfg["server"], *cfg["hosts"].values()])
+
+
+def logs():
+    pods = run(*ESS, "get", "pods", "-o", "name", capture=True).splitlines()
+    if not pods:
+        raise ValueError("No pods are running. Check element status.")
+    for index, pod in enumerate(pods, 1):
+        print(f"{index}. {pod}")
+    index = input("Pod number: ")
+    if not index.isdecimal() or not 1 <= int(index) <= len(pods):
+        raise ValueError("Choose a number from the list.")
+    run(*ESS, "logs", pods[int(index)-1], "--all-containers", "--prefix", "--tail=150")
+
+
+ACTIONS = ["status", "start", "stop", "restart", "update", "logs", "diagnose", "create-user", "verify"]
+
+
+@contextlib.contextmanager
+def locked():
+    import fcntl
+    with (STATE / "operation.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("Another Element operation is running.") from None
+        yield
+
+
+def action(name):
+    if name == "install":
+        install()
+        return
+    if not CONFIG.exists():
+        raise ValueError("Run the installer first.")
+    if name in ("status", "diagnose", "logs"):
+        {"status": status, "diagnose": diagnose, "logs": logs}[name]()
+        return
+    if not read(CONFIG).get("deployed"):
+        raise ValueError("Resume setup with element install.")
+    if name == "start":
+        scale(True)
+    elif name == "stop":
+        scale(False)
+    elif PAUSED.exists():
+        raise ValueError("The stack is stopped or scaling. Run element start first.")
+    elif name == "restart":
+        scale(False)
+        scale(True)
+    elif name == "update":
+        update()
+    elif name == "create-user":
+        register()
+    elif name == "verify":
+        verify(read(CONFIG))
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("--help", "-h"):
+        print("Usage: element [" + "|".join(["install", *ACTIONS]) + "]")
+        return
+    if len(args) > 1 or (args and args[0] not in ["install", *ACTIONS]):
+        raise SystemExit("Unknown command. Run element --help.")
+    if not sys.platform.startswith("linux"):
+        raise SystemExit("Run on a Debian or Ubuntu Linux VPS.")
+    if os.geteuid():
+        os.execvp("sudo", ["sudo", "/usr/bin/python3", "-I", str(Path(__file__).resolve()), *args])
+    os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    os.environ["KUBECONFIG"] = "/etc/rancher/k3s/k3s.yaml"
+    STATE.mkdir(mode=0o700, exist_ok=True)
+    CACHE.mkdir(mode=0o700, exist_ok=True)
+    if args:
+        with locked():
+            action(args[0])
+        return
+    while True:
+        print("\nElement Server Suite")
+        for i, name in enumerate(ACTIONS, 1):
+            print(f"  {i}. {name}")
+        choice = input("Choose an action (0 to exit): ").strip()
+        if choice == "0":
+            return
+        if choice.isdecimal() and 1 <= int(choice) <= len(ACTIONS):
+            try:
+                with locked():
+                    action(ACTIONS[int(choice)-1])
+            except (OSError, ValueError, subprocess.CalledProcessError, KeyboardInterrupt) as error:
+                print(f"Action interrupted or failed: {error}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError, KeyboardInterrupt, EOFError) as exc:
+        sys.exit(f"Operation interrupted or failed: {exc}\nCheck element diagnose. Resume setup with element install.")
