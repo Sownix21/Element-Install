@@ -7,8 +7,10 @@ reach github.com (and Let's Encrypt for certificates), not ghcr.io, quay.io,
 oci.element.io, docker.io or get.helm.sh.
 """
 import contextlib
+import getpass
 import gzip
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -22,6 +24,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 
 BUNDLE_REPO = "Sownix21/Element-Install"
@@ -92,10 +95,12 @@ def manifest(tag=None):
     """Fetch the bundle manifest: the latest bundle, or a pinned bundle tag."""
     where = f"download/{tag}" if tag else "latest/download"
     data = json.loads(download(f"{BUNDLE_URL}/{where}/manifest.json"))
-    if data.get("schema") != 1 or not NAME.fullmatch(data.get("tag", "")):
+    if (data.get("schema") != 1 or not NAME.fullmatch(data.get("tag", ""))
+            or data["tag"] in (".", "..") or (tag and tag != data["tag"])):
         raise ValueError("Unsupported bundle manifest. Rerun the one-line installer to refresh element.")
     for item in data["files"]:
-        if not NAME.fullmatch(item["name"]) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
+        if (not NAME.fullmatch(item["name"]) or item["name"] in (".", "..")
+                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
             raise ValueError(f"Invalid manifest entry: {item['name']}")
     data["base"] = f"{BUNDLE_URL}/download/{data['tag']}"
     return data
@@ -124,9 +129,12 @@ def fetch(man, item):
             print(f"Downloading {item['name']} ({item['size'] / 1e6:.0f} MB) ...", flush=True)
             try:
                 run(*CURL, "-C", "-", "-o", str(part), f"{man['base']}/{item['name']}")
-            except subprocess.CalledProcessError:
-                part.unlink(missing_ok=True)  # e.g. resume refused: start over once
-                continue
+            except subprocess.CalledProcessError as error:
+                if error.returncode in (33, 36) or (part.exists() and part.stat().st_size >= item["size"]):
+                    part.unlink(missing_ok=True)
+                    continue
+                # Keep partial content across network failures or operator retries.
+                raise
         if part.exists() and sha256(part) == item["sha256"]:
             os.replace(part, dest)
             return dest
@@ -273,9 +281,12 @@ def cluster(cfg, man):
     K3S_IMAGES.mkdir(parents=True, exist_ok=True)
     fresh = not (Path("/etc/systemd/system/k3s.service").exists() and shutil.which("k3s"))
     staged = K3S_IMAGES / airgap.name
-    newly_staged = not staged.exists()
+    newly_staged = not staged.exists() or sha256(staged) != one(man, "k3s-airgap")["sha256"]
     if newly_staged:
-        run("install", "-m", "0644", str(airgap), str(staged))
+        # Rename into the watched directory only after the whole file is present.
+        staging = K3S_IMAGES.parent / (airgap.name + ".part")
+        run("install", "-m", "0644", str(airgap), str(staging))
+        os.replace(staging, staged)
     if fresh:
         run("install", "-m", "0755", str(kbin), "/usr/local/bin/k3s")
         run("sh", str(installer), "server", env={**os.environ, "INSTALL_K3S_SKIP_DOWNLOAD": "true"})
@@ -295,6 +306,7 @@ def cluster(cfg, man):
         with tarfile.open(helm_tgz) as tar:
             data = tar.extractfile(f"linux-{ARCH}/helm").read()
         write(Path("/usr/local/bin/helm"), data, 0o755)
+        write(STATE / "helm.sha256", hashlib.sha256(data).hexdigest().encode())
     if not run("helm", "version", "--short", capture=True).startswith("v3."):
         raise ValueError("This installer requires Helm 3 on PATH.")
 
@@ -311,13 +323,17 @@ def cluster(cfg, man):
     run(*KUBE, "wait", "--for=condition=Ready", "clusterissuer/letsencrypt-prod", "--timeout=5m")
 
 
-def deploy(cfg, man):
+def helm_values():
+    return json.loads(run("helm", "get", "values", "ess", "-n", "ess", "-o", "json", capture=True)) or {}
+
+
+def deploy(cfg, man, settings=None, *, rollback_on_error=False):
     chart = fetch(man, one(man, "chart-ess"))
     load_images(man, "image-ess")
     print(f"Deploying official ESS Community {man['versions']['ess_tag']} ...", flush=True)
     run("helm", "upgrade", "--install", "ess", str(chart), "-n", "ess", "--create-namespace",
-        "--values", "-", "--wait", "--timeout", "20m",
-        input=json.dumps(values(cfg, traefik_ip())))
+        "--values", "-", "--wait", "--timeout", "20m", *(["--atomic"] if rollback_on_error else []),
+        input=json.dumps(settings if settings is not None else values(cfg, traefik_ip())))
 
 
 def verify(cfg):
@@ -383,6 +399,8 @@ def install():
         check_disk(man, "k3s-bin", "k3s-airgap", "helm", "chart-cm", "chart-ess", "image-cm", "image-ess")
         cluster(cfg, man)
         deploy(cfg, man)
+        cfg["version"] = man["versions"]["ess_tag"]
+        cfg["infrastructure_bundle"] = man["tag"]
         cfg["deployed"] = True
         save(CONFIG, cfg)
     verify(cfg)
@@ -401,6 +419,8 @@ def update():
     if len(releases) != 1:
         raise ValueError("Helm could not find the ESS release. Run element diagnose.")
     current = releases[0]
+    if cfg.get("bundle"):
+        cfg.setdefault("infrastructure_bundle", cfg["bundle"])
     print(f"Installed {current['chart']} ({current['status']}) | Latest {chart_name}")
     if current["status"] == "deployed" and current["chart"] == chart_name:
         cfg["version"] = tag
@@ -410,7 +430,7 @@ def update():
     print(f"https://github.com/element-hq/ess-helm/releases/tag/{tag}")
     if input("Review release notes and back up your data. Apply this release? [y/N] ").lower() == "y":
         check_disk(man, "chart-ess", "image-ess")
-        deploy(cfg, man)
+        deploy(cfg, man, helm_values())
         cfg["version"] = tag
         cfg["bundle"] = man["tag"]
         save(CONFIG, cfg)
@@ -462,6 +482,182 @@ def status():
     run(*ESS, "get", "deploy,sts,pod,pvc,ingress,certificate")
 
 
+def pinned_bundle(cfg):
+    if not cfg.get("bundle"):
+        raise ValueError("Run element update to associate this installation with a mirrored release.")
+    man = manifest(cfg["bundle"])
+    current = json.loads(run("helm", "list", "-n", "ess", "--filter", "^ess$",
+                             "-o", "json", capture=True))
+    if not current or current[0]["chart"] != "matrix-stack-" + man["versions"]["ess"]:
+        raise ValueError("Installed chart differs from the pinned bundle. Check element status and update.")
+    return man
+
+
+def settings(name):
+    cfg = read(CONFIG)
+    man = pinned_bundle(cfg)
+    active = helm_values()
+    if name == "upload-limit":
+        media = active.setdefault("synapse", {}).setdefault("media", {})
+        print("Current upload limit:", media.get("maxUploadSize", "chart default (100M)"))
+        size = input("New upload limit in MiB: ").strip()
+        if not re.fullmatch(r"[1-9][0-9]{0,6}", size):
+            raise ValueError("Enter a positive whole number of MiB (up to seven digits).")
+        media["maxUploadSize"] = size + "M"
+    else:
+        extra = active.setdefault("matrixAuthenticationService", {}).setdefault("additional", {})
+        mode = input("Public registration: enable / disable / cancel: ").strip().lower()
+        if mode == "cancel":
+            return
+        if mode not in ("enable", "disable"):
+            raise ValueError("Choose enable or disable.")
+        account = {"password_registration_enabled": mode == "enable"}
+        if mode == "enable":
+            account.update(password_registration_email_required=True, registration_token_required=False)
+            if input("Use existing working MAS SMTP settings? [y/N] ").lower() != "y":
+                host = hostname("SMTP hostname")
+                tls = input("SMTP security [starttls] or tls: ").strip() or "starttls"
+                port = int(input("SMTP port [587 for STARTTLS, 465 for TLS]: ") or
+                           (465 if tls == "tls" else 587))
+                sender = input("From email address: ").strip()
+                if tls not in ("starttls", "tls") or not 0 < port < 65536 or not re.fullmatch(r"[^\s@]+@[^\s@]+", sender):
+                    raise ValueError("Invalid SMTP settings.")
+                mail = dict(transport="smtp", hostname=host, mode=tls, port=port,
+                            reply_to=sender, **{"from": sender})
+                username = input("SMTP username (blank for relay): ").strip()
+                if username:
+                    mail.update(username=username, password=getpass.getpass("SMTP password: "))
+                payload = json.dumps({"email": mail})
+                secret = "element-install-mail-" + hashlib.sha256(payload.encode()).hexdigest()[:16]
+                run(*ESS, "apply", "--server-side", "--field-manager=element-install", "-f", "-", input=json.dumps({
+                    "apiVersion": "v1", "kind": "Secret", "metadata": {"name": secret},
+                    "stringData": {"mail.yaml": payload}}))
+                extra["zz-element-install-mail"] = {"configSecret": secret, "configSecretKey": "mail.yaml"}
+        extra["zz-element-install-registration"] = {"config": json.dumps({"account": account})}
+    deploy(cfg, man, active, rollback_on_error=True)
+    print("Helm applied the settings.")
+
+
+def user_action(name):
+    if name == "users":
+        run(*ESS, "exec", "sts/ess-postgres", "--", "psql", "-X", "-U", "postgres",
+            "-d", "matrixauthenticationservice", "-P", "pager=off", "-c",
+            "SELECT username, locked_at, deactivated_at FROM users ORDER BY username")
+        return
+    username = input("Local username (e.g. alice): ").strip()
+    if not username or username.startswith("-") or ":" in username or username.startswith("@"):
+        raise ValueError("Enter the local username.")
+    if name == "deactivate-user":
+        if input(f"Deactivate {username} and remove their access? Type {username} to confirm: ") == username:
+            run(*ESS, "exec", "deploy/ess-matrix-authentication-service", "--",
+                "mas-cli", "manage", "lock-user", "--deactivate", "--", username)
+        return
+    host = read(CONFIG)["hosts"]["matrixAuthenticationService"]
+    token = getpass.getpass(f"MAS admin access token for {host}: ")
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    with contextlib.closing(http.client.HTTPSConnection(host, timeout=30)) as conn:
+        conn.request("GET", "/api/admin/v1/users/by-username/" + quote(username, safe=""), headers=headers)
+        reply = conn.getresponse()
+        if reply.status != 200:
+            raise ValueError(f"MAS user lookup returned HTTP {reply.status}. Check username and admin token.")
+        uid = quote(json.loads(reply.read())["data"]["id"], safe="")
+        password = getpass.getpass("New account password: ")
+        if not password or password != getpass.getpass("Repeat password: "):
+            raise ValueError("Passwords must be nonempty and match.")
+        conn.request("POST", f"/api/admin/v1/users/{uid}/set-password",
+                     json.dumps({"password": password}), headers)
+        reply = conn.getresponse()
+        if reply.status != 204:
+            raise ValueError(f"MAS rejected the password change (HTTP {reply.status}).")
+        print("Password changed.")
+
+
+BACKUPS = Path("/var/backups/element-install")
+LOCAL_STORAGE = Path("/var/lib/rancher/k3s/storage")
+
+
+def backup():
+    print("A cold backup pauses messages and calls while copying the database and media.")
+    if input("Create a local backup now? [y/N] ").lower() != "y":
+        return
+    claims = json.loads(run(*ESS, "get", "pvc", "-o", "json", capture=True))["items"]
+    volumes = {}
+    storage = LOCAL_STORAGE.resolve()
+    for claim in claims:
+        pv = json.loads(run(*KUBE, "get", "pv", claim["spec"]["volumeName"], "-o", "json", capture=True))
+        spec = pv["spec"]
+        path = Path(spec.get("hostPath", spec.get("local", {})).get("path", "/")).resolve()
+        if storage not in path.parents or not path.is_dir():
+            raise ValueError("Cold backup requires K3s local-path storage on this node.")
+        volumes[claim["metadata"]["name"]] = path
+    if not {"ess-postgres-data", "ess-synapse-media"}.issubset(volumes):
+        raise ValueError("Expected the bundled PostgreSQL and Synapse media claims.")
+    BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    resume = not PAUSED.exists()
+    with tempfile.TemporaryDirectory(dir=BACKUPS) as tmp:
+        stage = Path(tmp)
+        try:
+            scale(False)
+            # Controllers can report zero before terminating pods release their disks.
+            for _ in range(120):
+                pods = json.loads(run(*ESS, "get", "pods", "-o", "json", capture=True))
+                if all(p["status"].get("phase") in ("Succeeded", "Failed") for p in pods["items"]):
+                    break
+                time.sleep(2)
+            else:
+                raise ValueError("ESS pods still active. Volume copy cancelled.")
+            save(stage / "config.json", read(CONFIG))
+            save(stage / "values.json", helm_values())
+            save(stage / "replicas.json", read(PAUSED))
+            for resource in ("secret", "configmap", "pvc"):
+                write(stage / (resource + ".json"),
+                      run(*ESS, "get", resource, "-o", "json", capture=True).encode())
+            archive = stage / "backup.tgz"
+            with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
+                for item in sorted(stage.glob("*.json")):
+                    tar.add(item, item.name)
+                for claim, path in volumes.items():
+                    tar.add(path, "volumes/" + claim)
+            dest = BACKUPS / ("element-" + time.strftime("%Y%m%d-%H%M%S") + "-" + stage.name + ".tgz")
+            os.chmod(archive, 0o600)
+            archive.rename(dest)
+            print(f"Backup saved to {dest}", flush=True)
+        finally:
+            if resume and PAUSED.exists():
+                scale(True)
+
+
+def uninstall():
+    cfg = read(CONFIG)
+    print("This deletes the entire dedicated K3s cluster, all workloads, accounts, messages, media,")
+    print(f"installer files, and ALL local archives in {BACKUPS}. Copy needed backups off the VPS first.")
+    if input(f"Type DELETE {cfg['server']} to confirm: ") != "DELETE " + cfg["server"]:
+        print("Cancelled.")
+        return
+    uninstaller = Path("/usr/local/bin/k3s-uninstall.sh")
+    if uninstaller.is_file():
+        run("sh", str(uninstaller))
+    elif shutil.which("k3s") or Path("/etc/systemd/system/k3s.service").exists():
+        raise ValueError("K3s uninstall script missing. Restore it before retrying.")
+    helm = Path("/usr/local/bin/helm")
+    if helm.is_file():
+        digest = sha256(helm)
+        owned = STATE / "helm.sha256"
+        if owned.exists() and owned.read_text() == digest:
+            helm.unlink()
+        elif not owned.exists():
+            print("Helm ownership was not recorded by the older installer. Keeping the shared binary.")
+    for path in (CACHE, BACKUPS, Path("/var/lib/rancher/k3s/server/manifests/traefik-config.yaml")):
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    COMMAND.unlink(missing_ok=True)
+    shutil.rmtree(STATE)
+    print("Element uninstalled.")
+    raise SystemExit(0)
+
+
 def diagnose():
     for cmd in [["systemctl", "--no-pager", "status", "k3s"], ["df", "-h", "/var/lib"],
                 ["free", "-h"], ["journalctl", "-u", "k3s", "-n", "30", "--no-pager"],
@@ -475,6 +671,26 @@ def diagnose():
             subprocess.run(cmd, check=False)
     cfg = read(CONFIG)
     dns([cfg["server"], *cfg["hosts"].values()])
+    if not sys.stdin.isatty() or PAUSED.exists():
+        return
+    if not Path("/etc/systemd/system/k3s.service").exists():
+        print("K3s installation is incomplete. Resume with element install.")
+        return
+    if subprocess.run(["systemctl", "is-active", "--quiet", "k3s"]).returncode:
+        if input("K3s is inactive. Start it? [y/N] ").lower() != "y":
+            return
+        run("systemctl", "start", "k3s")
+    for namespace, role in (("ess", "image-ess"), ("cert-manager", "image-cm")):
+        pods = json.loads(run(*KUBE, "-n", namespace, "get", "pods", "-o", "json", capture=True))
+        broken = [p["metadata"]["name"] for p in pods["items"] if any(
+            c.get("state", {}).get("waiting", {}).get("reason") in ("ErrImagePull", "ImagePullBackOff")
+            for key in ("containerStatuses", "initContainerStatuses") for c in p["status"].get(key, []))]
+        if broken:
+            print("Image pull failures:", ", ".join(broken))
+            tag = cfg.get("bundle") if namespace == "ess" else cfg.get("infrastructure_bundle", cfg.get("bundle"))
+            if tag and input("Reload missing images from the recorded bundle? [y/N] ").lower() == "y":
+                load_images(manifest(tag), role)
+                print("Kubelet retries pending pods automatically. Check element status.")
 
 
 def logs():
@@ -489,7 +705,8 @@ def logs():
     run(*ESS, "logs", pods[int(index)-1], "--all-containers", "--prefix", "--tail=150")
 
 
-ACTIONS = ["status", "start", "stop", "restart", "update", "logs", "diagnose", "create-user", "verify"]
+ACTIONS = ["status", "start", "stop", "restart", "update", "logs", "diagnose", "create-user", "verify",
+           "registration", "upload-limit", "users", "deactivate-user", "reset-password", "backup", "uninstall"]
 
 
 @contextlib.contextmanager
@@ -509,8 +726,8 @@ def action(name):
         return
     if not CONFIG.exists():
         raise ValueError("Run the installer first.")
-    if name in ("status", "diagnose", "logs"):
-        {"status": status, "diagnose": diagnose, "logs": logs}[name]()
+    if name in ("status", "diagnose", "logs", "uninstall"):
+        {"status": status, "diagnose": diagnose, "logs": logs, "uninstall": uninstall}[name]()
         return
     if not read(CONFIG).get("deployed"):
         raise ValueError("Resume setup with element install.")
@@ -518,6 +735,8 @@ def action(name):
         scale(True)
     elif name == "stop":
         scale(False)
+    elif name == "backup":
+        backup()
     elif PAUSED.exists():
         raise ValueError("The stack is stopped or scaling. Run element start first.")
     elif name == "restart":
@@ -527,6 +746,10 @@ def action(name):
         update()
     elif name == "create-user":
         register()
+    elif name in ("registration", "upload-limit"):
+        settings(name)
+    elif name in ("users", "deactivate-user", "reset-password"):
+        user_action(name)
     elif name == "verify":
         verify(read(CONFIG))
 

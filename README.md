@@ -1,5 +1,7 @@
 # Element Install
 
+[راهنمای فارسی](README.fa.md)
+
 Install Element Server Suite Community on a single Linux VPS and manage it by typing `element`. This independent installer automates Element's quick setup. The Matrix server, authentication service, web and admin clients, calling backend, and bundled PostgreSQL database come from Element's official Helm chart. [Upstream project and Community edition details](https://github.com/element-hq/ess-helm)
 
 ## Before you start
@@ -29,7 +31,7 @@ Run this in an interactive SSH session on the VPS. The command downloads the ins
 From a local checkout you can run `/usr/bin/python3 -I ./element install` instead.
 
 1. Enter the identity domain, confirm the five service names, and supply a contact email for Let's Encrypt. Check the resolved IPs before confirming.
-2. The installer sets up K3s, Traefik, Helm 3, cert-manager, and a production Let's Encrypt issuer. It looks up Element's latest stable GitHub release and installs the matching chart from Element's registry. K3s installs and enables its own `k3s.service` systemd unit for boot.
+2. The installer pins a release from this project's GitHub mirror, verifies each downloaded file against its SHA-256 manifest, and loads the bundled images directly into K3s. The bundle includes K3s, its system images, Helm 3, the ESS and cert-manager charts, and their images. K3s enables its own systemd service at boot.
 3. When certificates and HTTPS checks pass, the installer offers to create the first user. In the MAS wizard, choose **Set a password** and finish creating the account. You can run `element create-user` again later.
 4. Open the printed Element Web URL, sign in, and try a message. For a calling deployment, test a call between clients on separate networks. [Matrix federation tester](https://federationtester.matrix.org/)
 
@@ -43,13 +45,36 @@ Type **`element`** from any directory to open the numbered menu. Each menu item 
 | `element stop` | Save the replica counts for ESS Deployments and StatefulSets and scale them to zero. Data stays on the VPS. |
 | `element start` | Restore saved counts and wait for the workloads to roll out. |
 | `element restart` | Stop and start the ESS workloads. Expect downtime. |
-| `element update` | Compare the installed chart to the latest official stable release, display the release notes link, and ask before upgrading. |
+| `element update` | Compare the installed chart to the latest mirrored ESS release and ask before upgrading with your current Helm settings. |
 | `element logs` | Choose a pod and read its recent container logs. |
-| `element diagnose` | Inspect K3s, disk, memory, pods, volume claims, certificate challenges, DNS, Helm history, and warning events. |
+| `element diagnose` | Inspect K3s, disk, memory, pods, certificates, DNS and events. In an interactive terminal, it offers to start inactive K3s or reload missing ESS or cert-manager images when a pod reports a pull failure. |
 | `element create-user` | Open the official interactive MAS registration command. |
 | `element verify` | Wait for certificates and test Matrix discovery, the client API, and the Element Web URL over HTTPS. |
+| `element registration` | Enable or disable public password signup. Enabling requires verified email. Use working MAS SMTP settings or enter your relay details. |
+| `element upload-limit` | Set the Synapse upload limit in MiB using the installed chart. An external proxy may impose its own limit. |
+| `element users` | List local MAS accounts with lock and deactivation timestamps from the bundled PostgreSQL database. |
+| `element deactivate-user` | Enter and confirm a local username to deactivate it through MAS. This can remove the account from rooms. |
+| `element reset-password` | Change a local password using a MAS admin token. The token and password are entered at hidden prompts. |
+| `element backup` | Pause workloads and archive the database, media, settings and secrets. The command restores the previous running state after the copy. |
+| `element uninstall` | Wipe the entire dedicated K3s cluster, installer state, cache, and local Element backups. Type the displayed domain-specific phrase to proceed. |
 
 The K3s service and certificate controller stay up when Element is stopped. Kubernetes retains the scaled workload settings across reboots. The operator command lives at `/usr/local/bin/element`. The setup choices and any saved replica counts live under `/etc/element-install/`. K3s holds the database, media volumes, and generated secrets.
+
+For password resets, use an administrator account to obtain a short-lived token with the `urn:mas:admin` scope through the documented device login flow. Paste the access token when prompted. Users need their own Matrix recovery key or a verified device to recover encrypted history. [MAS access tokens](https://element-hq.github.io/matrix-authentication-service/topics/access-token.html)
+
+After enabling registration, try signing up with a new address and check that the verification email arrives. SMTP credentials are stored in a Kubernetes Secret. Disabling registration closes new password signups and existing accounts can still sign in.
+
+## GitHub mirror
+
+GitHub Actions checks upstream daily at **03:17 UTC** on the default branch. A version change triggers a bundle build. The runner fetches official artifacts, renders the charts to identify their images, and publishes a GitHub Release after uploading the assets. The default workflow builds for **amd64**. For ARM, include `arm64` in `ARCHES` and build a bundle with that architecture. Use **Actions → Build install bundle → Run workflow** for the first build or a retry. The workflow needs permission to write repository contents. [Bundle releases](https://github.com/Sownix21/Element-Install/releases)
+
+The VPS needs access to GitHub raw content, releases and their asset CDN, plus Let's Encrypt and the distribution mirror for any missing OS packages. Existing installations upgrade on demand with `element update`. Rerun the one-liner to get a newer management console.
+
+## Backups and recovery
+
+`element backup` writes a root-only, **unencrypted** archive under `/var/backups/element-install/`. Allow space there for the compressed database and media. Messages and calls pause during the copy. If the host loses power during backup, use `element start` to resume a previously running stack. Copy the archive off the VPS before uninstalling.
+
+This is a physical backup for the bundled PostgreSQL and K3s local storage. It includes all ESS PVC directories under `volumes/<claim>`, plus installer config, actual Helm values, replica counts, secrets and config maps. Recovery is manual. On an isolated compatible node use the same domain, chart and PostgreSQL major version. Recreate the required generated secrets, SMTP secrets and deployment markers from the exports, then provision matching claims. With all ESS workloads stopped, restore each archived volume into its corresponding claim directory with original numeric ownership and permissions. Reapply the saved chart values, start the recorded workloads and test sign-in, media and calls before switching DNS. The archive contains account and encryption secrets. Keep access to it restricted. [Element maintenance guide](https://github.com/element-hq/ess-helm/blob/main/docs/maintenance.md)
 
 ## Recovery and updates
 
@@ -60,4 +85,4 @@ The K3s service and certificate controller stay up when Element is stopped. Kube
 - **Failed upgrade:** Inspect `element diagnose` for the Helm revision and workload failures. A failed release can be retried with `element update`. An interrupted Helm operation marked pending may require manual recovery using Helm history and the matching release notes before a retry. [Upstream troubleshooting](https://github.com/element-hq/ess-helm/blob/main/docs/troubleshooting.md)
 - **Installer and infrastructure updates:** `element update` upgrades the ESS chart and the components it packages. Rerun the one-liner to refresh the management script. K3s, Helm, cert-manager, and the OS have their own upgrade procedures.
 
-For an existing cluster, external PostgreSQL, a shared reverse proxy, custom certificates, or public self-registration with SMTP, use the corresponding upstream setup instructions. [Element advanced configuration](https://github.com/element-hq/ess-helm/blob/main/docs/advanced.md)
+For an existing cluster, external PostgreSQL, a shared reverse proxy or custom certificates, use the corresponding upstream setup instructions. [Element advanced configuration](https://github.com/element-hq/ess-helm/blob/main/docs/advanced.md)

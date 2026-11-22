@@ -1,8 +1,13 @@
 name: Build install bundle
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/mirror.yml"
+      - "scripts/build-bundle.sh"
   schedule:
-    - cron: "17 3 * * 1"   # weekly; does nothing if no component version changed
+    - cron: "17 3 * * *"    # daily, UTC
   workflow_dispatch:
 
 permissions:
@@ -24,6 +29,11 @@ jobs:
       DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check installer and bundle builder
+        run: |
+          python3 -B -m unittest discover -s tests -v
+          bash -n scripts/build-bundle.sh
 
       - name: Install skopeo if the runner image lacks it
         run: command -v skopeo >/dev/null || (sudo apt-get update && sudo apt-get install -y skopeo)

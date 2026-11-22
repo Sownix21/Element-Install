@@ -29,8 +29,12 @@ HELM_TAG="$(gh api 'repos/helm/helm/releases?per_page=100' --jq '.[] | select(.p
 ESS_VER="${ESS_TAG#v}"
 
 BUNDLE_TAG="bundle-ess${ESS_VER}-cm${CM_TAG}-k3s${K3S_TAG//+/-}-helm${HELM_TAG}"
+if [[ $ARCHES != amd64 ]]; then
+  BUNDLE_TAG+="-${ARCHES// /-}"
+fi
 echo "Bundle: $BUNDLE_TAG"
-if gh release view "$BUNDLE_TAG" >/dev/null 2>&1; then
+draft=$(gh release view "$BUNDLE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
+if [[ $draft == false ]]; then
   echo "Release $BUNDLE_TAG already exists, nothing to do."
   exit 0
 fi
@@ -52,7 +56,7 @@ for arch in $ARCHES; do
 done
 
 # -------------------------------------------------------------------- k3s ---
-curl -fsSL --retry 3 https://get.k3s.io -o dist/k3s-install.sh
+curl -fsSL --retry 3 "https://raw.githubusercontent.com/k3s-io/k3s/$K3S_TAG/install.sh" -o dist/k3s-install.sh
 head -c 2 dist/k3s-install.sh | grep -q '#!' || die "get.k3s.io did not return a script"
 register k3s-install all k3s-install.sh
 
@@ -162,8 +166,11 @@ PY
 
 # ----------------------------------------------------------------- publish --
 # Create as a draft, then publish, so the VPS never sees a half-uploaded release.
-gh release create "$BUNDLE_TAG" dist/* --draft --title "$BUNDLE_TAG" \
-  --notes "ESS ${ESS_VER}, cert-manager ${CM_TAG}, K3s ${K3S_TAG}, Helm ${HELM_TAG}. Built for: ${ARCHES}."
+if [[ $draft != true ]]; then
+  gh release create "$BUNDLE_TAG" --draft --title "$BUNDLE_TAG" --target "$GITHUB_SHA" \
+    --notes "ESS ${ESS_VER}, cert-manager ${CM_TAG}, K3s ${K3S_TAG}, Helm ${HELM_TAG}. Built for: ${ARCHES}."
+fi
+gh release upload "$BUNDLE_TAG" dist/* --clobber
 gh release edit "$BUNDLE_TAG" --draft=false --latest
 echo "Published $BUNDLE_TAG"
 
