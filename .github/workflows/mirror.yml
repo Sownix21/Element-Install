@@ -7,6 +7,7 @@ on:
       - ".github/workflows/mirror.yml"
       - "scripts/build-bundle.sh"
       - "scripts/platforms.py"
+      - "scripts/bundle_inputs.py"
   schedule:
     - cron: "17 3 * * *"    # daily, UTC
   workflow_dispatch:

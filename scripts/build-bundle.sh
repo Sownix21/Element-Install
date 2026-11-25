@@ -36,8 +36,11 @@ HELM_TAG="$(gh api 'repos/helm/helm/releases?per_page=100' --jq '.[] | select(.p
 # -------------------------------------------------------------------- helm --
 get_helm() {  # arch outdir
   local f="helm-${HELM_TAG}-linux-$1.tar.gz"
+  if [[ ! -f work/helm-$1.sum ]]; then
+    curl -fsSL --retry 3 "https://get.helm.sh/$f.sha256sum" -o "work/helm-$1.sum"
+  fi
   curl -fsSL --retry 3 "https://get.helm.sh/$f" -o "$2/$f"
-  echo "$(curl -fsSL --retry 3 "https://get.helm.sh/$f.sha256sum" | cut -d' ' -f1)  $f" | (cd "$2" && sha256sum -c -)
+  echo "$(awk 'NR == 1 {print $1}' "work/helm-$1.sum")  $f" | (cd "$2" && sha256sum -c -)
 }
 get_helm amd64 work
 tar -xzf "work/helm-${HELM_TAG}-linux-amd64.tar.gz" -C work --strip-components=1 linux-amd64/helm
@@ -91,12 +94,37 @@ gh release view "$K3S_TAG" -R k3s-io/k3s --json assets --jq '.assets[].name' > w
 gh release view "$HELM_TAG" -R helm/helm --json assets --jq '.assets[].name' > work/helm-assets
 python3 scripts/platforms.py "$HELM_TAG" > work/platforms.json
 ARCHES=$(jq -r 'keys | join(" ")' work/platforms.json)
-fingerprint=$(sha256sum work/platforms.json "dist/cert-manager-${CM_TAG}.tgz" scripts/{build-bundle.sh,platforms.py} | sha256sum | cut -c1-16)
-BUNDLE_TAG="bundle-ess${ESS_VER}-cm${CM_TAG}-k3s${K3S_TAG//+/-}-helm${HELM_TAG}-$fingerprint"
+curl -fsSL --retry 3 "https://raw.githubusercontent.com/k3s-io/k3s/$K3S_TAG/install.sh" -o dist/k3s-install.sh
+head -c 2 dist/k3s-install.sh | grep -q '#!' || die "invalid K3s install script"
+register k3s-install all k3s-install.sh
+for arch in $ARCHES; do
+  gh release download "$K3S_TAG" -R k3s-io/k3s -D work -p "sha256sum-$arch.txt"
+  if [[ ! -f work/helm-$arch.sum ]]; then
+    curl -fsSL --retry 3 "https://get.helm.sh/helm-$HELM_TAG-linux-$arch.tar.gz.sha256sum" -o "work/helm-$arch.sum"
+  fi
+done
+fingerprint=$(python3 scripts/bundle_inputs.py candidate work "$ESS_VER" "$CM_TAG" "$K3S_TAG" "$HELM_TAG")
+# Compare to the release actually offered to a fresh VPS, including bundles
+# published before input fingerprints were added. Fail on network errors.
+latest_tag=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json isLatest,tagName --jq '.[] | select(.isLatest) | .tagName')
+if [[ -n $latest_tag ]]; then
+  gh release download "$latest_tag" -p manifest.json -D work/latest
+  previous=$(jq -r '.inputs_sha256 // empty' work/latest/manifest.json)
+  if [[ -z $previous ]]; then
+    gh release download "$latest_tag" -p 'matrix-stack-*.tgz' -p 'cert-manager-*.tgz' -D work/latest
+    previous=$(python3 scripts/bundle_inputs.py published work/latest)
+  fi
+  if [[ $fingerprint == "$previous" ]]; then
+    echo "Installation inputs match $latest_tag. No new release."
+    exit 0
+  fi
+fi
+BUNDLE_TAG="bundle-ess${ESS_VER}-cm${CM_TAG}-k3s${K3S_TAG//+/-}-helm${HELM_TAG}-${fingerprint:0:16}"
 echo "Bundle $BUNDLE_TAG for $ARCHES"
 draft=$(gh release view "$BUNDLE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
 if [[ $draft == false ]]; then
-  echo "Matching bundle already published."
+  gh release edit "$BUNDLE_TAG" --latest
+  echo "Restored matching release as latest."
   exit 0
 fi
 
@@ -106,17 +134,13 @@ for arch in $ARCHES; do
 done
 
 # -------------------------------------------------------------------- k3s ---
-curl -fsSL --retry 3 "https://raw.githubusercontent.com/k3s-io/k3s/$K3S_TAG/install.sh" -o dist/k3s-install.sh
-head -c 2 dist/k3s-install.sh | grep -q '#!' || die "get.k3s.io did not return a script"
-register k3s-install all k3s-install.sh
-
 for arch in $ARCHES; do
   bin=$(jq -r --arg arch "$arch" '.[$arch].binary' work/platforms.json)
   air="k3s-airgap-images-$arch.tar.gz"
   sums="sha256sum-$arch.txt"
-  gh release download "$K3S_TAG" -R k3s-io/k3s -D "work/k3s-$arch" -p "$bin" -p "$air" -p "$sums"
+  gh release download "$K3S_TAG" -R k3s-io/k3s -D "work/k3s-$arch" -p "$bin" -p "$air"
   (cd "work/k3s-$arch"
-   awk -v b="$bin" -v a="$air" '$2==b || $2==a' "$sums" > want.txt
+   awk -v b="$bin" -v a="$air" '$2==b || $2==a' "../$sums" > want.txt
    [[ $(wc -l < want.txt) -eq 2 ]] || die "K3s checksums missing for $arch"
    sha256sum -c want.txt)
   mv "work/k3s-$arch/$bin" "dist/k3s-$arch"
@@ -147,7 +171,7 @@ done
 if [[ -n "$(find dist -type f -size +1900M)" ]]; then die "an asset is too large for a release"; fi
 
 # ---------------------------------------------------------------- manifest --
-export ESS_COMMIT ARCHES BUNDLE_TAG ESS_TAG ESS_VER CM_TAG K3S_TAG HELM_TAG
+export ESS_COMMIT ARCHES BUNDLE_TAG ESS_TAG ESS_VER CM_TAG K3S_TAG HELM_TAG fingerprint
 python3 - <<'PY'
 import hashlib, json, os, pathlib
 
@@ -168,7 +192,7 @@ for line in open("work/files.tsv"):
     files.append(item)
 
 env = os.environ
-manifest = {"schema": 1, "tag": env["BUNDLE_TAG"],
+manifest = {"schema": 1, "tag": env["BUNDLE_TAG"], "inputs_sha256": env["fingerprint"],
             "versions": {"ess": env["ESS_VER"], "ess_tag": env["ESS_TAG"],
                          "cert_manager": env["CM_TAG"], "k3s": env["K3S_TAG"], "helm": env["HELM_TAG"]},
             "source_commit": env["ESS_COMMIT"], "architectures": env["ARCHES"].split(), "files": files}
@@ -176,6 +200,8 @@ with open("dist/manifest.json", "w") as out:
     json.dump(manifest, out, indent=2)
 print(f"manifest.json: {len(files)} files, {sum(f['size'] for f in files) / 1e9:.2f} GB")
 PY
+# Check that the uploaded files match the inputs inspected before mirroring.
+[[ $(python3 scripts/bundle_inputs.py published dist) == "$fingerprint" ]] || die "bundle inputs changed during build"
 
 # ----------------------------------------------------------------- publish --
 # Create as a draft, then publish, so the VPS never sees a half-uploaded release.
