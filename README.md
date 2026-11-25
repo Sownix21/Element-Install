@@ -66,7 +66,9 @@ After enabling registration, try signing up with a new address and check that th
 
 ## GitHub mirror
 
-GitHub Actions checks upstream daily at **03:17 UTC** on the default branch. A version change triggers a bundle build. The runner fetches official artifacts, renders the charts to identify their images, and publishes a GitHub Release after uploading the assets. The default workflow builds for **amd64**. For ARM, include `arm64` in `ARCHES` and build a bundle with that architecture. Use **Actions → Build install bundle → Run workflow** for the first build or a retry. The workflow needs permission to write repository contents. [Bundle releases](https://github.com/Sownix21/Element-Install/releases)
+GitHub Actions checks upstream daily at **03:17 UTC**. The mirror packages the latest commit on Element's `main` that touched `charts/matrix-stack`, including changes between stable releases. The manifest records the source commit. Changes to that revision, dependency versions, selected image digests, available platforms, cert-manager chart content or the bundle builder trigger a fresh bundle. Use **Actions → Build install bundle → Run workflow** to check immediately. [Bundle releases](https://github.com/Sownix21/Element-Install/releases)
+
+Each release lists its supported Linux architectures in `manifest.json` under `architectures`. The runner matches published K3s binaries and air-gap archives to Helm binaries, then checks every required container image for each platform. A missing platform is explained in the build log. The VPS downloads its own architecture and shared charts. Existing servers opt in to the main snapshot using `element update`.
 
 The VPS needs access to GitHub raw content, releases and their asset CDN, plus Let's Encrypt and the distribution mirror for any missing OS packages. Existing installations upgrade on demand with `element update`. Rerun the one-liner to get a newer management console.
 

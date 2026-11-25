@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Mirrors everything the `element` installer needs into ./dist and publishes it
 # as a GitHub Release. Runs on a GitHub-hosted runner (see mirror.yml).
-# Needs: gh, curl, skopeo, python3. Set ARCHES="amd64 arm64" to mirror both.
+# Needs: gh, curl, skopeo, python3. Platform selection is based on upstream artifacts.
 set -euo pipefail
 
-ARCHES="${ARCHES:-amd64}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 rm -rf dist work && mkdir -p dist work
 : > work/files.tsv
@@ -12,7 +11,16 @@ register() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}" >> work/files.tsv
 
 # ---------------------------------------------------------------- versions --
 latest() { gh api "repos/$1/releases/latest" --jq .tag_name; }
-ESS_TAG="$(latest element-hq/ess-helm)"
+# Resolve one immutable main revision touching the chart, including its resources.
+ESS_COMMIT="$(gh api 'repos/element-hq/ess-helm/commits?sha=main&path=charts/matrix-stack&per_page=1' --jq '.[0].sha')"
+[[ $ESS_COMMIT =~ ^[a-f0-9]{40}$ ]] || die "invalid ESS source revision"
+curl -fsSL --retry 3 "https://codeload.github.com/element-hq/ess-helm/tar.gz/$ESS_COMMIT" -o work/source.tgz
+tar -xzf work/source.tgz -C work "ess-helm-$ESS_COMMIT/charts/matrix-stack"
+chart="work/ess-helm-$ESS_COMMIT/charts/matrix-stack"
+base=$(awk '$1=="version:" {print $2}' "$chart/Chart.yaml")
+[[ $base =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev)?$ ]] || die "unexpected chart version $base"
+ESS_VER="${base%-dev}-sha${ESS_COMMIT:0:12}"
+ESS_TAG="$ESS_VER"
 CM_TAG="$(latest cert-manager/cert-manager)"
 # Same channel the official K3s installer uses by default.
 K3S_TAG="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://update.k3s.io/v1-release/channels/stable \
@@ -22,23 +30,9 @@ K3S_TAG="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://update.k3s.io/v
 HELM_TAG="$(gh api 'repos/helm/helm/releases?per_page=100' --jq '.[] | select(.prerelease|not) | .tag_name' \
            | grep -E '^v3\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
 
-[[ $ESS_TAG  =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]                || die "odd ESS tag: $ESS_TAG"
 [[ $CM_TAG   =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]                 || die "odd cert-manager tag: $CM_TAG"
 [[ $K3S_TAG  =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$ ]]      || die "odd K3s tag: $K3S_TAG"
 [[ $HELM_TAG =~ ^v3\.[0-9]+\.[0-9]+$ ]]                      || die "odd Helm tag: $HELM_TAG"
-ESS_VER="${ESS_TAG#v}"
-
-BUNDLE_TAG="bundle-ess${ESS_VER}-cm${CM_TAG}-k3s${K3S_TAG//+/-}-helm${HELM_TAG}"
-if [[ $ARCHES != amd64 ]]; then
-  BUNDLE_TAG+="-${ARCHES// /-}"
-fi
-echo "Bundle: $BUNDLE_TAG"
-draft=$(gh release view "$BUNDLE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
-if [[ $draft == false ]]; then
-  echo "Release $BUNDLE_TAG already exists, nothing to do."
-  exit 0
-fi
-
 # -------------------------------------------------------------------- helm --
 get_helm() {  # arch outdir
   local f="helm-${HELM_TAG}-linux-$1.tar.gz"
@@ -49,34 +43,8 @@ get_helm amd64 work
 tar -xzf "work/helm-${HELM_TAG}-linux-amd64.tar.gz" -C work --strip-components=1 linux-amd64/helm
 HELM="$PWD/work/helm"
 
-for arch in $ARCHES; do
-  [[ $arch == amd64 || $arch == arm64 ]] || die "unsupported arch $arch"
-  get_helm "$arch" dist
-  register helm "$arch" "helm-${HELM_TAG}-linux-$arch.tar.gz"
-done
-
-# -------------------------------------------------------------------- k3s ---
-curl -fsSL --retry 3 "https://raw.githubusercontent.com/k3s-io/k3s/$K3S_TAG/install.sh" -o dist/k3s-install.sh
-head -c 2 dist/k3s-install.sh | grep -q '#!' || die "get.k3s.io did not return a script"
-register k3s-install all k3s-install.sh
-
-for arch in $ARCHES; do
-  bin=k3s; [[ $arch == arm64 ]] && bin=k3s-arm64
-  air="k3s-airgap-images-$arch.tar.gz"
-  sums="sha256sum-$arch.txt"
-  gh release download "$K3S_TAG" -R k3s-io/k3s -D "work/k3s-$arch" -p "$bin" -p "$air" -p "$sums"
-  (cd "work/k3s-$arch"
-   awk -v b="$bin" -v a="$air" '$2==b || $2==a' "$sums" > want.txt
-   [[ $(wc -l < want.txt) -eq 2 ]] || die "K3s checksums missing for $arch"
-   sha256sum -c want.txt)
-  cp "work/k3s-$arch/$bin" "dist/k3s-$arch"
-  cp "work/k3s-$arch/$air" "dist/$air"
-  register k3s-bin "$arch" "k3s-$arch"
-  register k3s-airgap "$arch" "$air"
-done
-
 # ------------------------------------------------------------------ charts --
-"$HELM" pull oci://ghcr.io/element-hq/ess-helm/matrix-stack --version "$ESS_VER" -d dist
+"$HELM" package "$chart" --version "$ESS_VER" -d dist
 "$HELM" pull oci://quay.io/jetstack/charts/cert-manager --version "$CM_TAG" -d dist
 register chart-ess all "matrix-stack-${ESS_VER}.tgz"
 register chart-cm all "cert-manager-${CM_TAG}.tgz"
@@ -117,12 +85,55 @@ check_refs < work/cm-images.txt
 echo "ESS images:";          cat work/ess-images.txt
 echo "cert-manager images:"; cat work/cm-images.txt
 
+# Discover complete targets before checking the release: a newly supported
+# platform or an upstream image retag must invalidate the previous bundle.
+gh release view "$K3S_TAG" -R k3s-io/k3s --json assets --jq '.assets[].name' > work/k3s-assets
+gh release view "$HELM_TAG" -R helm/helm --json assets --jq '.assets[].name' > work/helm-assets
+python3 scripts/platforms.py "$HELM_TAG" > work/platforms.json
+ARCHES=$(jq -r 'keys | join(" ")' work/platforms.json)
+fingerprint=$(sha256sum work/platforms.json "dist/cert-manager-${CM_TAG}.tgz" scripts/{build-bundle.sh,platforms.py} | sha256sum | cut -c1-16)
+BUNDLE_TAG="bundle-ess${ESS_VER}-cm${CM_TAG}-k3s${K3S_TAG//+/-}-helm${HELM_TAG}-$fingerprint"
+echo "Bundle $BUNDLE_TAG for $ARCHES"
+draft=$(gh release view "$BUNDLE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
+if [[ $draft == false ]]; then
+  echo "Matching bundle already published."
+  exit 0
+fi
+
+for arch in $ARCHES; do
+  get_helm "$arch" dist
+  register helm "$arch" "helm-${HELM_TAG}-linux-$arch.tar.gz"
+done
+
+# -------------------------------------------------------------------- k3s ---
+curl -fsSL --retry 3 "https://raw.githubusercontent.com/k3s-io/k3s/$K3S_TAG/install.sh" -o dist/k3s-install.sh
+head -c 2 dist/k3s-install.sh | grep -q '#!' || die "get.k3s.io did not return a script"
+register k3s-install all k3s-install.sh
+
+for arch in $ARCHES; do
+  bin=$(jq -r --arg arch "$arch" '.[$arch].binary' work/platforms.json)
+  air="k3s-airgap-images-$arch.tar.gz"
+  sums="sha256sum-$arch.txt"
+  gh release download "$K3S_TAG" -R k3s-io/k3s -D "work/k3s-$arch" -p "$bin" -p "$air" -p "$sums"
+  (cd "work/k3s-$arch"
+   awk -v b="$bin" -v a="$air" '$2==b || $2==a' "$sums" > want.txt
+   [[ $(wc -l < want.txt) -eq 2 ]] || die "K3s checksums missing for $arch"
+   sha256sum -c want.txt)
+  mv "work/k3s-$arch/$bin" "dist/k3s-$arch"
+  mv "work/k3s-$arch/$air" "dist/$air"
+  register k3s-bin "$arch" "k3s-$arch"
+  register k3s-airgap "$arch" "$air"
+done
+
 mirror_image() {  # role arch ref
   local role=$1 arch=$2 ref=$3 name
   name="image-${arch}-$(tr '/:' '__' <<<"$ref").tar"
   echo "==> $ref ($arch)"
+  local digest pinned
+  digest=$(jq -er --arg arch "$arch" --arg ref "$ref" '.[$arch].images[$ref]' work/platforms.json)
+  pinned="${ref%:*}@$digest"
   skopeo copy --retry-times 5 --override-os linux --override-arch "$arch" \
-    "docker://$ref" "docker-archive:work/$name:$ref"
+    "docker://$pinned" "docker-archive:work/$name:$ref"
   gzip -6 -f "work/$name"
   mv "work/$name.gz" "dist/$name.gz"
   register "$role" "$arch" "$name.gz" "$ref"
@@ -136,10 +147,11 @@ done
 if [[ -n "$(find dist -type f -size +1900M)" ]]; then die "an asset is too large for a release"; fi
 
 # ---------------------------------------------------------------- manifest --
-export BUNDLE_TAG ESS_TAG ESS_VER CM_TAG K3S_TAG HELM_TAG
+export ESS_COMMIT ARCHES BUNDLE_TAG ESS_TAG ESS_VER CM_TAG K3S_TAG HELM_TAG
 python3 - <<'PY'
 import hashlib, json, os, pathlib
 
+plan = json.loads(pathlib.Path("work/platforms.json").read_text())
 files = []
 for line in open("work/files.tsv"):
     role, arch, name, ref = line.rstrip("\n").split("\t")
@@ -152,13 +164,14 @@ for line in open("work/files.tsv"):
             "sha256": digest.hexdigest(), "size": path.stat().st_size}
     if ref:
         item["ref"] = ref
+        item["source_digest"] = plan[arch]["images"][ref]
     files.append(item)
 
 env = os.environ
 manifest = {"schema": 1, "tag": env["BUNDLE_TAG"],
             "versions": {"ess": env["ESS_VER"], "ess_tag": env["ESS_TAG"],
                          "cert_manager": env["CM_TAG"], "k3s": env["K3S_TAG"], "helm": env["HELM_TAG"]},
-            "files": files}
+            "source_commit": env["ESS_COMMIT"], "architectures": env["ARCHES"].split(), "files": files}
 with open("dist/manifest.json", "w") as out:
     json.dump(manifest, out, indent=2)
 print(f"manifest.json: {len(files)} files, {sum(f['size'] for f in files) / 1e9:.2f} GB")

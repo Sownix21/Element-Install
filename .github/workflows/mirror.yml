@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/mirror.yml"
       - "scripts/build-bundle.sh"
+      - "scripts/platforms.py"
   schedule:
     - cron: "17 3 * * *"    # daily, UTC
   workflow_dispatch:
@@ -24,7 +25,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      ARCHES: "amd64"                       # use "amd64 arm64" if any VPS is ARM
       DH_USER: ${{ secrets.DOCKERHUB_USER }}   # optional, avoids Docker Hub rate limits
       DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:

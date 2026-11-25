@@ -35,7 +35,8 @@ CONFIG = STATE / "config.json"
 PAUSED = STATE / "replicas.json"
 COMMAND = Path("/usr/local/bin/element")
 K3S_IMAGES = Path("/var/lib/rancher/k3s/agent/images")
-ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine())
+ARCH = {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm",
+        "armv8l": "arm"}.get(platform.machine(), platform.machine())
 KUBE = ["k3s", "kubectl"]
 CTR = ["k3s", "ctr", "-n", "k8s.io", "images"]
 ESS = [*KUBE, "-n", "ess"]
@@ -103,6 +104,9 @@ def manifest(tag=None):
                 or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
             raise ValueError(f"Invalid manifest entry: {item['name']}")
     data["base"] = f"{BUNDLE_URL}/download/{data['tag']}"
+    available = sorted({f["arch"] for f in data["files"] if f["role"] == "k3s-bin"})
+    if ARCH not in available:
+        raise ValueError(f"Bundle {data['tag']} has no complete build for {ARCH}. Available: {', '.join(available)}.")
     return data
 
 
@@ -159,8 +163,12 @@ def norm(ref):
 def load_images(man, *roles):
     """Import bundled images into K3s's containerd. Skips ones already present."""
     have = set(run(*CTR, "ls", "-q", capture=True).split())
+    receipts = STATE / "image-digests.json"
+    loaded = read(receipts) if receipts.exists() else {}
     for item in pick(man, *roles):
-        if norm(item["ref"]) in have:
+        ref = norm(item["ref"])
+        digest = item.get("source_digest", item["sha256"])
+        if ref in have and loaded.get(ref) == digest:
             continue
         print(f"Loading {item['ref']} ...", flush=True)
         archive = fetch(man, item)
@@ -169,6 +177,8 @@ def load_images(man, *roles):
             with gzip.open(archive, "rb") as src, tmp.open("wb") as dst:
                 shutil.copyfileobj(src, dst, 1 << 20)
             run(*CTR, "import", str(tmp))
+            loaded[ref] = digest
+            save(receipts, loaded)
         finally:
             tmp.unlink(missing_ok=True)
         archive.unlink()
@@ -422,12 +432,16 @@ def update():
     if cfg.get("bundle"):
         cfg.setdefault("infrastructure_bundle", cfg["bundle"])
     print(f"Installed {current['chart']} ({current['status']}) | Latest {chart_name}")
-    if current["status"] == "deployed" and current["chart"] == chart_name:
+    if (current["status"] == "deployed" and current["chart"] == chart_name
+            and cfg.get("bundle") == man["tag"]):
         cfg["version"] = tag
         cfg["bundle"] = man["tag"]
         save(CONFIG, cfg)
         return
-    print(f"https://github.com/element-hq/ess-helm/releases/tag/{tag}")
+    if "source_commit" in man:
+        print("Upstream main snapshot: https://github.com/element-hq/ess-helm/commit/" + man["source_commit"])
+    else:
+        print(f"https://github.com/element-hq/ess-helm/releases/tag/{tag}")
     if input("Review release notes and back up your data. Apply this release? [y/N] ").lower() == "y":
         check_disk(man, "chart-ess", "image-ess")
         deploy(cfg, man, helm_values())
